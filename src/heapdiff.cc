@@ -48,41 +48,46 @@ heapdiff::HeapDiff::~HeapDiff()
 void
 heapdiff::HeapDiff::Initialize ( v8::Handle<v8::Object> target )
 {
-    v8::HandleScope scope;
-    v8::Local<v8::FunctionTemplate> t = v8::FunctionTemplate::New(New);
+    Isolate *isolate = Isolate::GetCurrent();
+    v8::Local<v8::FunctionTemplate> t = v8::FunctionTemplate::New(isolate,New);
     t->InstanceTemplate()->SetInternalFieldCount(1);
-    t->SetClassName(String::NewSymbol("HeapDiff"));
+    t->SetClassName(String::NewFromUtf8(isolate, "HeapDiff"));
 
     NODE_SET_PROTOTYPE_METHOD(t, "end", End);
 
-    target->Set(v8::String::NewSymbol( "HeapDiff"), t->GetFunction());
+    target->Set(v8::String::NewFromUtf8( isolate, "HeapDiff"), t->GetFunction());
 }
 
-v8::Handle<v8::Value>
-heapdiff::HeapDiff::New (const v8::Arguments& args)
+//v8::Handle<v8::Value>
+void
+heapdiff::HeapDiff::New (const v8::FunctionCallbackInfo<v8::Value>& args)
 {
+    Isolate *isolate = args.GetIsolate();
     // Don't blow up when the caller says "new require('memwatch').HeapDiff()"
     // issue #30
     // stolen from: https://github.com/kkaefer/node-cpp-modules/commit/bd9432026affafd8450ecfd9b49b7dc647b6d348
     if (!args.IsConstructCall()) {
-        return ThrowException(
+        isolate->ThrowException(
             Exception::TypeError(
-                String::New("Use the new operator to create instances of this object.")));
+                String::NewFromUtf8(isolate,"Use the new operator to create instances of this object.")));
+    }
+    else {
+      v8::HandleScope scope(isolate);
+
+      // allocate the underlying c++ class and wrap it up in the this pointer
+      HeapDiff * self = new HeapDiff();
+      self->Wrap(args.This());
+
+      // take a snapshot and save a pointer to it
+      s_inProgress = true;
+      s_startTime = time(NULL);
+      v8::HeapProfiler *heapProfiler = isolate->GetHeapProfiler();
+      self->before = heapProfiler->TakeHeapSnapshot(v8::String::NewFromUtf8(isolate,""), NULL, NULL );
+      s_inProgress = false;
+
+      args.GetReturnValue().Set( args.This() );
     }
 
-    v8::HandleScope scope;
-
-    // allocate the underlying c++ class and wrap it up in the this pointer
-    HeapDiff * self = new HeapDiff();
-    self->Wrap(args.This());
-
-    // take a snapshot and save a pointer to it
-    s_inProgress = true;
-    s_startTime = time(NULL);
-    self->before = v8::HeapProfiler::TakeSnapshot(v8::String::New(""));
-    s_inProgress = false;
-
-    return args.This();
 }
 
 static string handleToStr(const Handle<Value> & str)
@@ -94,7 +99,8 @@ static string handleToStr(const Handle<Value> & str)
 static void
 buildIDSet(set<uint64_t> * seen, const HeapGraphNode* cur, int & s)
 {
-    v8::HandleScope scope;
+    Isolate *isolate = Isolate::GetCurrent();
+    v8::HandleScope scope(isolate);
 
     // cycle detection
     if (seen->find(cur->GetId()) != seen->end()) {
@@ -116,6 +122,7 @@ buildIDSet(set<uint64_t> * seen, const HeapGraphNode* cur, int & s)
         buildIDSet(seen, cur->GetChild(i)->GetToNode(), s);
     }
 }
+
 
 typedef set<uint64_t> idset;
 
@@ -146,6 +153,7 @@ public:
                 self_size(0), retained_size(0), retainers(0) { };
 };
 
+
 class change
 {
 public:
@@ -156,6 +164,7 @@ public:
 
     change() : size(0), added(0), released(0) { }
 };
+
 
 typedef std::map<std::string, change>changeset;
 
@@ -208,68 +217,73 @@ static void manageChange(changeset & changes, const HeapGraphNode * node, bool a
     return;
 }
 
+
 static Handle<Value> changesetToObject(changeset & changes)
 {
-    v8::HandleScope scope;
-    Local<Array> a = Array::New();
+    Isolate *isolate = Isolate::GetCurrent();
+    v8::EscapableHandleScope handleScope(isolate);
+    Local<Array> a = Array::New(isolate);
 
     for (changeset::iterator i = changes.begin(); i != changes.end(); i++) {
-        Local<Object> d = Object::New();
-        d->Set(String::New("what"), String::New(i->first.c_str()));
-        d->Set(String::New("size_bytes"), Integer::New(i->second.size));
-        d->Set(String::New("size"), String::New(mw_util::niceSize(i->second.size).c_str()));
-        d->Set(String::New("+"), Integer::New(i->second.added));
-        d->Set(String::New("-"), Integer::New(i->second.released));
+        Local<Object> d = Object::New(isolate);
+        d->Set(String::NewFromUtf8(isolate, "what"), String::NewFromUtf8(isolate, i->first.c_str()));
+        d->Set(String::NewFromUtf8(isolate, "size_bytes"), Integer::New(isolate, i->second.size));
+        d->Set(String::NewFromUtf8(isolate, "size"), String::NewFromUtf8(isolate,mw_util::niceSize(i->second.size).c_str()));
+        d->Set(String::NewFromUtf8(isolate, "+"), Integer::New(isolate, i->second.added));
+        d->Set(String::NewFromUtf8(isolate, "-"), Integer::New(isolate, i->second.released));
         a->Set(a->Length(), d);
     }
 
-    return scope.Close(a);
+    return handleScope.Escape( a );
+
 }
+
 
 
 static v8::Handle<Value>
 compare(const v8::HeapSnapshot * before, const v8::HeapSnapshot * after)
 {
-    v8::HandleScope scope;
+    Isolate *isolate = Isolate::GetCurrent();
+    v8::EscapableHandleScope handleScope(isolate);
     int s, diffBytes;
 
-    Local<Object> o = Object::New();
+    Local<Object> o = Object::New(isolate);
 
     // first let's append summary information
-    Local<Object> b = Object::New();
-    b->Set(String::New("nodes"), Integer::New(before->GetNodesCount()));
-    b->Set(String::New("time"), NODE_UNIXTIME_V8(s_startTime));
-    o->Set(String::New("before"), b);
+    Local<Object> b = Object::New(isolate);
+    b->Set(String::NewFromUtf8(isolate, "nodes"), Integer::New(isolate, before->GetNodesCount()));
+    b->Set(String::NewFromUtf8(isolate, "time"), NODE_UNIXTIME_V8(s_startTime));
+    o->Set(String::NewFromUtf8(isolate, "before"), b);
 
-    Local<Object> a = Object::New();
-    a->Set(String::New("nodes"), Integer::New(after->GetNodesCount()));
-    a->Set(String::New("time"), NODE_UNIXTIME_V8(time(NULL)));
-    o->Set(String::New("after"), a);
+    Local<Object> a = Object::New(isolate);
+    a->Set(String::NewFromUtf8(isolate, "nodes"), Integer::New(isolate, after->GetNodesCount()));
+    a->Set(String::NewFromUtf8(isolate, "time"), NODE_UNIXTIME_V8(time(NULL)));
+    o->Set(String::NewFromUtf8(isolate, "after"), a);
 
     // now let's get allocations by name
     set<uint64_t> beforeIDs, afterIDs;
     s = 0;
     buildIDSet(&beforeIDs, before->GetRoot(), s);
-    b->Set(String::New("size_bytes"), Integer::New(s));
-    b->Set(String::New("size"), String::New(mw_util::niceSize(s).c_str()));
+    b->Set(String::NewFromUtf8(isolate, "size_bytes"), Integer::New(isolate, s));
+    b->Set(String::NewFromUtf8(isolate, "size"), String::NewFromUtf8(isolate, mw_util::niceSize(s).c_str()));
 
     diffBytes = s;
     s = 0;
     buildIDSet(&afterIDs, after->GetRoot(), s);
-    a->Set(String::New("size_bytes"), Integer::New(s));
-    a->Set(String::New("size"), String::New(mw_util::niceSize(s).c_str()));
+    a->Set(String::NewFromUtf8(isolate, "size_bytes"), Integer::New(isolate, s));
+    a->Set(String::NewFromUtf8(isolate, "size"), String::NewFromUtf8(isolate, mw_util::niceSize(s).c_str()));
 
     diffBytes = s - diffBytes;
 
-    Local<Object> c = Object::New();
-    c->Set(String::New("size_bytes"), Integer::New(diffBytes));
-    c->Set(String::New("size"), String::New(mw_util::niceSize(diffBytes).c_str()));
-    o->Set(String::New("change"), c);
+    Local<Object> c = Object::New(isolate);
+    c->Set(String::NewFromUtf8(isolate, "size_bytes"), Integer::New(isolate, diffBytes));
+    c->Set(String::NewFromUtf8(isolate, "size"), String::NewFromUtf8(isolate, mw_util::niceSize(diffBytes).c_str()));
+    o->Set(String::NewFromUtf8(isolate, "change"), c);
 
     // before - after will reveal nodes released (memory freed)
     vector<uint64_t> changedIDs;
     setDiff(beforeIDs, afterIDs, changedIDs);
-    c->Set(String::New("freed_nodes"), Integer::New(changedIDs.size()));
+    c->Set(String::NewFromUtf8(isolate, "freed_nodes"), Integer::New(isolate, changedIDs.size()));
 
     // here's where we'll collect all the summary information
     changeset changes;
@@ -285,48 +299,54 @@ compare(const v8::HeapSnapshot * before, const v8::HeapSnapshot * after)
     // after - before will reveal nodes added (memory allocated)
     setDiff(afterIDs, beforeIDs, changedIDs);
 
-    c->Set(String::New("allocated_nodes"), Integer::New(changedIDs.size()));
+    c->Set(String::NewFromUtf8(isolate, "allocated_nodes"), Integer::New(isolate, changedIDs.size()));
 
     for (unsigned long i = 0; i < changedIDs.size(); i++) {
         const HeapGraphNode * n = after->GetNodeById(changedIDs[i]);
         manageChange(changes, n, true);
     }
 
-    c->Set(String::New("details"), changesetToObject(changes));
+    c->Set(String::NewFromUtf8(isolate, "details"), changesetToObject(changes));
 
-    return scope.Close(o);
+    //handleScope.Escape( o );
+    return handleScope.Escape( o );
 }
 
-v8::Handle<Value>
-heapdiff::HeapDiff::End( const Arguments& args )
+void
+heapdiff::HeapDiff::End( const FunctionCallbackInfo<v8::Value>& args )
 {
+    Isolate *isolate = args.GetIsolate();
     // take another snapshot and compare them
-    v8::HandleScope scope;
 
-    HeapDiff *t = Unwrap<HeapDiff>( args.This() );
+    HeapDiff *t = ObjectWrap::Unwrap<HeapDiff>( args.Holder() );
 
     // How shall we deal with double .end()ing?  The only reasonable
     // approach seems to be an exception, cause nothing else makes
     // sense.
     if (t->ended) {
-        return v8::ThrowException(
+        //return v8::ThrowException(
+        isolate->ThrowException(
             v8::Exception::Error(
-                v8::String::New("attempt to end() a HeapDiff that was "
+                v8::String::NewFromUtf8(isolate, "attempt to end() a HeapDiff that was "
                                 "already ended")));
     }
-    t->ended = true;
+    else {
 
-    s_inProgress = true;
-    t->after = v8::HeapProfiler::TakeSnapshot(v8::String::New(""));
-    s_inProgress = false;
+      t->ended = true;
 
-    v8::Handle<Value> comparison = compare(t->before, t->after);
-    // free early, free often.  I mean, after all, this process we're in is
-    // probably having memory problems.  We want to help her.
-    ((HeapSnapshot *) t->before)->Delete();
-    t->before = NULL;
-    ((HeapSnapshot *) t->after)->Delete();
-    t->after = NULL;
+      s_inProgress = true;
 
-    return scope.Close(comparison);
+      t->after = isolate->GetHeapProfiler()->TakeHeapSnapshot(v8::String::NewFromUtf8(isolate, ""));
+      s_inProgress = false;
+
+      v8::Handle<Value> comparison = compare(t->before, t->after);
+      // free early, free often.  I mean, after all, this process we're in is
+      // probably having memory problems.  We want to help her.
+      ((HeapSnapshot *) t->before)->Delete();
+      t->before = NULL;
+      ((HeapSnapshot *) t->after)->Delete();
+      t->after = NULL;
+
+      args.GetReturnValue().Set( comparison );
+    }
 }

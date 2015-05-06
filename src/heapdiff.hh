@@ -8,6 +8,7 @@
 #include <v8.h>
 #include <v8-profiler.h>
 #include <node.h>
+#include <node_object_wrap.h>
 
 namespace heapdiff 
 {
@@ -16,8 +17,8 @@ namespace heapdiff
       public:
         static void Initialize ( v8::Handle<v8::Object> target );
 
-        static v8::Handle<v8::Value> New( const v8::Arguments& args );
-        static v8::Handle<v8::Value> End( const v8::Arguments& args );
+        static void New( const v8::FunctionCallbackInfo<v8::Value>& info );
+        static void End( const v8::FunctionCallbackInfo<v8::Value>& info );
         static bool InProgress();
 
       protected:
